@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import '../models/paper_model.dart';
 import 'translation_helper.dart';
@@ -27,7 +28,12 @@ class ApiService {
       'limit': limit.toString(),
     };
 
-    final Uri url = Uri.https(_baseUrl, _searchPath, queryParameters);
+    Uri url = Uri.https(_baseUrl, _searchPath, queryParameters);
+    
+    // On web, bypass CORS using a CORS proxy
+    if (kIsWeb) {
+      url = Uri.parse('https://corsproxy.io/?${Uri.encodeComponent(url.toString())}');
+    }
     
     int retryCount = 0;
     const int maxRetries = 2;
@@ -36,10 +42,14 @@ class ApiService {
       try {
         final response = await http.get(
           url,
-          headers: {
-            "User-Agent": "AegisMedSearch/1.0 (Flutter; Research Tool)",
-            "Accept": "application/json",
-          },
+          headers: kIsWeb
+              ? {
+                  "Accept": "application/json",
+                }
+              : {
+                  "User-Agent": "AegisMedSearch/1.0 (Flutter; Research Tool)",
+                  "Accept": "application/json",
+                },
         ).timeout(const Duration(seconds: 15));
 
         if (response.statusCode == 200) {
