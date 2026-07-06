@@ -28,20 +28,40 @@ class ApiService {
       'limit': limit.toString(),
     };
 
-    Uri url = Uri.https(_baseUrl, _searchPath, queryParameters);
+    final Uri baseApiUrl = Uri.https(_baseUrl, _searchPath, queryParameters);
     
-    // On web, bypass CORS using a CORS proxy
+    final List<Uri> urlsToTry = [];
     if (kIsWeb) {
-      url = Uri.parse('https://corsproxy.io/?${Uri.encodeComponent(url.toString())}');
+      // Try direct connection first, as Semantic Scholar supports CORS natively for successful requests.
+      // This uses the client's own IP, avoiding shared proxy rate limits.
+      urlsToTry.add(baseApiUrl);
+
+      final String rawUrlStr = baseApiUrl.toString();
+      final List<String> proxyTemplates = [
+        'https://corsproxy.io/?',
+        'https://api.allorigins.win/raw?url=',
+        'https://api.cors.lol/?url=',
+        'https://api.codetabs.com/v1/proxy?quest=',
+      ];
+      // Shuffle proxies to distribute load as fallbacks
+      final List<String> shuffledTemplates = List.from(proxyTemplates)..shuffle();
+      for (final prefix in shuffledTemplates) {
+        urlsToTry.add(Uri.parse('$prefix${Uri.encodeComponent(rawUrlStr)}'));
+      }
+    } else {
+      // On mobile/desktop, add the direct URL 3 times to simulate 3 retries
+      urlsToTry.add(baseApiUrl);
+      urlsToTry.add(baseApiUrl);
+      urlsToTry.add(baseApiUrl);
     }
     
-    int retryCount = 0;
-    const int maxRetries = 2;
+    String lastErrorType = 'NetworkError';
 
-    while (true) {
+    for (int i = 0; i < urlsToTry.length; i++) {
+      final currentUrl = urlsToTry[i];
       try {
         final response = await http.get(
-          url,
+          currentUrl,
           headers: kIsWeb
               ? {
                   "Accept": "application/json",
@@ -50,7 +70,7 @@ class ApiService {
                   "User-Agent": "AegisMedSearch/1.0 (Flutter; Research Tool)",
                   "Accept": "application/json",
                 },
-        ).timeout(const Duration(seconds: 15));
+        ).timeout(const Duration(seconds: 10));
 
         if (response.statusCode == 200) {
           final Map<String, dynamic> data = json.decode(response.body);
@@ -81,28 +101,26 @@ class ApiService {
 
           return papers;
         } else if (response.statusCode == 429) {
-          // If rate limited, wait and retry
-          if (retryCount < maxRetries) {
-            retryCount++;
-            await Future.delayed(Duration(milliseconds: 1000 * retryCount));
-            continue;
-          }
-          throw Exception('RateLimitError');
+          lastErrorType = 'RateLimitError';
+          // Wait a bit before trying the next proxy/retry
+          await Future.delayed(Duration(milliseconds: 500 * (i + 1)));
+          continue;
         } else {
-          throw Exception('ServerError');
-        }
-      } catch (e) {
-        if (e.toString().contains('RateLimitError')) {
-          rethrow;
-        }
-        // For other network errors, retry once
-        if (retryCount < 1) {
-          retryCount++;
-          await Future.delayed(const Duration(seconds: 1));
+          lastErrorType = 'ServerError';
+          await Future.delayed(Duration(milliseconds: 300 * (i + 1)));
           continue;
         }
-        throw Exception('NetworkError');
+      } catch (e) {
+        if (e is FormatException) {
+          lastErrorType = 'ServerError';
+        } else {
+          lastErrorType = 'NetworkError';
+        }
+        await Future.delayed(Duration(milliseconds: 300 * (i + 1)));
+        continue;
       }
     }
+
+    throw Exception(lastErrorType);
   }
 }
