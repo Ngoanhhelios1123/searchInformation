@@ -121,6 +121,117 @@ class ApiService {
       }
     }
 
-    throw Exception(lastErrorType);
+    // If Semantic Scholar fails, attempt fallback to Europe PMC API.
+    // Europe PMC is a reliable, open life sciences database that supports CORS natively.
+    try {
+      return await _searchEuropePMC(
+        query: query,
+        limit: limit,
+        filterMedicineOnly: filterMedicineOnly,
+        sortBy: sortBy,
+      );
+    } catch (e) {
+      // If the fallback also fails, throw the original exception.
+      throw Exception(lastErrorType);
+    }
+  }
+
+  /// Fallback search in Europe PMC when Semantic Scholar fails.
+  static Future<List<Paper>> _searchEuropePMC({
+    required String query,
+    required int limit,
+    bool filterMedicineOnly = true,
+    String sortBy = 'relevance',
+  }) async {
+    final translationInfo = TranslationHelper.getTranslationInfo(query);
+    final finalQuery = translationInfo['enhanced'] ?? query;
+
+    final String url = 'https://www.ebi.ac.uk/europepmc/webservices/rest/search'
+        '?query=${Uri.encodeComponent(finalQuery)}'
+        '&format=json'
+        '&pageSize=$limit'
+        '&resultType=core';
+
+    final response = await http.get(
+      Uri.parse(url),
+      headers: {
+        'Accept': 'application/json',
+      },
+    ).timeout(const Duration(seconds: 10));
+
+    if (response.statusCode != 200) {
+      throw Exception('ServerError');
+    }
+
+    final Map<String, dynamic> data = json.decode(response.body);
+    final List<dynamic> resultsJson = data['resultList']?['result'] ?? [];
+
+    List<Paper> papers = resultsJson.map((item) {
+      // Parse authors
+      List<String> authors = [];
+      if (item['authorString'] != null) {
+        authors = (item['authorString'] as String)
+            .split(',')
+            .map((e) => e.trim())
+            .where((e) => e.isNotEmpty)
+            .toList();
+      }
+
+      // Parse journal
+      String? journalName;
+      if (item['journalInfo'] != null && item['journalInfo']['journal'] != null) {
+        journalName = item['journalInfo']['journal']['title'] as String?;
+      }
+      journalName ??= item['journalTitle'] as String?;
+
+      // Parse URL
+      String? paperUrl = item['url'] as String?;
+      if (paperUrl == null || paperUrl.isEmpty) {
+        if (item['doi'] != null && (item['doi'] as String).isNotEmpty) {
+          paperUrl = 'https://doi.org/${item['doi']}';
+        } else {
+          paperUrl = 'https://europepmc.org/article/${item['source'] ?? 'MED'}/${item['id']}';
+        }
+      }
+
+      // Parse TLDR (using the first sentence of the abstract)
+      String? tldrText;
+      if (item['abstractText'] != null && (item['abstractText'] as String).isNotEmpty) {
+        final abs = item['abstractText'] as String;
+        final cleanAbs = abs.replaceAll(RegExp(r'<[^>]*>'), '');
+        final sentences = cleanAbs.split(RegExp(r'\. (?=[A-Z])'));
+        if (sentences.isNotEmpty) {
+          tldrText = sentences.first.trim();
+          if (!tldrText.endsWith('.')) tldrText += '.';
+        }
+      }
+
+      return Paper(
+        id: item['id']?.toString() ?? '',
+        title: item['title'] ?? 'No Title',
+        authors: authors,
+        year: int.tryParse(item['pubYear']?.toString() ?? ''),
+        journal: journalName,
+        url: paperUrl,
+        abstractText: item['abstractText'] as String?,
+        tldr: tldrText,
+        citationCount: item['citedByCount'] as int? ?? 0,
+        fieldsOfStudy: const ['Medicine'], // Hardcode medicine to pass filter
+      );
+    }).toList();
+
+    // Sort papers
+    if (sortBy == 'year') {
+      papers.sort((a, b) {
+        if (a.year == null && b.year == null) return 0;
+        if (a.year == null) return 1;
+        if (b.year == null) return -1;
+        return b.year!.compareTo(a.year!);
+      });
+    } else if (sortBy == 'citations') {
+      papers.sort((a, b) => b.citationCount.compareTo(a.citationCount));
+    }
+
+    return papers;
   }
 }
